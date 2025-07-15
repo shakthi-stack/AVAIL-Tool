@@ -1,0 +1,14 @@
+name: face-detection-tool
+channels:
+  - defaults
+dependencies:
+  - python=3.8
+  - tensorflow
+  - torchaudio
+  - scipy
+  - cudatoolkit=11.3
+  - keras
+  - tqdm
+  - torchvision
+  - pytorch
+  - cudnn
