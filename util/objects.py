@@ -60,6 +60,12 @@ class Face(DetectedObject):
 
     def get_eyes(self):
         return self.eyes
+    
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        d["forward_neighbor"]  = None                  
+        d["backward_neighbor"] = None
+        return d
 
     def __str__(self):
         return "face at ({}, {}) with size ({}, {})".format(self.x, self.y, self.w, self.h)

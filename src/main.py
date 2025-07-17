@@ -127,7 +127,7 @@ def write_dummy_annotations(pickle_path: Path):
         frames = pickle.load(f)
     n_frames = len(frames)
 
-    dummy = [ManualAnnotation(False, False, False) for _ in range(n_frames)]
+    dummy = [ManualAnnotation("",False, False, False) for _ in range(n_frames)]
     ann_path = pickle_path.with_name(pickle_path.stem + "_manual_annotations.pickle")
     with open(ann_path, "wb") as f:
         pickle.dump(dummy, f)
@@ -249,9 +249,11 @@ class VideoTab(QWidget):
         else:
             self.parent.logView.append(f"{self.video_name}: relinking…")
 
-        RemoveNeighborsPass(None, self.frames_cache).execute()
+        
         vd = VideoData(str(self.video_path), "")
         VideoProcessor([NearestNeighborPass(vd, self.frames_cache)]).process()
+
+        RemoveNeighborsPass(None, self.frames_cache).execute()
 
         # overwrite pickle
         with open(self.video_path.with_suffix(".pickle"), "wb") as f:
@@ -343,7 +345,7 @@ class VideoWorker(QObject):
         frames = self.workspace / 'frames'
         frames.mkdir(exist_ok=True)
         py = sys.executable
-        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 'haar']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
+        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 's3fd']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
         print(f"[DEBUG] Worker finished for {self.filename}: {ok}")
         self.finished.emit(self.filename, ok)
 
