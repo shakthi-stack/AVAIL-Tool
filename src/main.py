@@ -18,6 +18,7 @@ MANUAL_DIR = ROOT_DIR / "manual_annotation"
 if str(MANUAL_DIR) not in sys.path:
     sys.path.insert(0, str(MANUAL_DIR))
 
+from gallery_worker import GalleryWorker
 from passes.nearest_neighbor_pass import NearestNeighborPass
 from passes.nearest_neighbor_pass import RemoveNeighborsPass
 from manual_annotation.annotation_utils import ManualAnnotation
@@ -167,87 +168,59 @@ class VideoTab(QWidget):
 
         self._load_gallery()
 
-    def _load_gallery(self):
-
-        def _iou(a, b):
-            xa1, ya1, xa2, ya2 = a
-            xb1, yb1, xb2, yb2 = b
-            iw = max(0, min(xa2, xb2) - max(xa1, xb1))
-            ih = max(0, min(ya2, yb2) - max(ya1, yb1))
-            inter = iw * ih
-            return inter / ((xa2-xa1)*(ya2-ya1) + (xb2-xb1)*(yb2-yb1) - inter + 1e-6)
-
+    def _load_gallery(self) -> None:
+       
         pkl = self.video_path.with_suffix(".pickle")
-        with open(pkl, "rb") as f:
-            frames = pickle.load(f)
-        self.frames_cache = frames                       
-
-        for fd in frames:
-            merged = []
-            for face in fd.faces:
-                r = (face.x, face.y, face.x+face.w, face.y+face.h)
-                if all(_iou(r, (m.x, m.y, m.x+m.w, m.y+m.h)) <= 0.5 for m in merged):
-                    merged.append(face)
-            fd.faces = merged
-
-        vd = VideoData(str(self.video_path), str(pkl))
-        VideoProcessor([NearestNeighborPass(vd, frames)]).process()
-        assign_chain_ids(frames)                         # helper lives in main.py
-
-        MIN_LEN = 8
-        counts  = Counter(f.cid for fr in frames for f in fr.faces)
-        short   = {cid for cid, n in counts.items() if n < MIN_LEN}
-        for fr in frames:
-            fr.faces = [f for f in fr.faces if f.cid not in short]
-        assign_chain_ids(frames)
-
-        frames_root = self.parent.WORKSPACE_DIR / "frames"
-        chains: dict[int, list] = {}
-        vid_stem = pkl.stem
-        for fd in frames:
-            jpg = frames_root / vid_stem / f"{fd.index}.jpg"
-            if not jpg.exists():
-                jpg = frames_root / f"{fd.index}.jpg"
-            for face in fd.faces:
-                chains.setdefault(face.cid, []).append((str(jpg), face))
-
         self.faceList.clear()
-        for cid, samples in chains.items():
-            path, face = samples[len(samples)//2]       # middle sample
-            img  = cv2.imread(path)
-            x,y,w,h = face.x, face.y, face.w, face.h
-            crop = img[max(y-5,0):y+h+5, max(x-5,0):x+w+5]
-            thumb = cv2.resize(crop, (96,96))
-            rgb   = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
-            qimg  = QImage(rgb.data, rgb.shape[1], rgb.shape[0],
-                           3*rgb.shape[1], QImage.Format.Format_RGB888)
-            it = QListWidgetItem(QIcon(QPixmap.fromImage(qimg)), "")
-            it.setData(Qt.ItemDataRole.UserRole, cid)
-            it.setCheckState(Qt.CheckState.Checked)
-            self.faceList.addItem(it)
+        self.faceList.addItem("Loading…")
+        self._worker_thread = QThread(self)
+        self._worker        = GalleryWorker(pkl)
+        self._worker.moveToThread(self._worker_thread)
 
-        self.parent.logView.append(
-            f"{self.video_name}: loaded {len(chains)} chains for review.")
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.finished.connect(self._on_gallery_ready)  
+        self._worker.finished.connect(self._worker_thread.quit)
+
+        self._worker_thread.start()
+
+        with open(pkl, "rb") as f:
+            self.frames_cache = pickle.load(f)
+
+
+    def _on_gallery_ready(self, payload):
+        clusters, thumbs = payload['clusters'], payload['thumbs']
+        self.faceList.clear()
+        for lbl, cid_list in clusters.items():
+            qimg = thumbs[lbl]                         
+            it = QListWidgetItem(QIcon(QPixmap.fromImage(qimg)), "")
+            it.setData(Qt.ItemDataRole.UserRole, cid_list)
+            it.setCheckState(Qt.CheckState.Unchecked)  
+            self.faceList.addItem(it)
+        self.parent.logView.append(f"{self.video_name}: loaded {len(clusters)} identities for review.")
 
     def on_continue(self):
 
         if self.frames_cache is None:
             QMessageBox.information(self, "No gallery", "Load gallery first.")
             return
-
-        unchecked = {
-            self.faceList.item(i).data(Qt.ItemDataRole.UserRole)
+        vd = VideoData(str(self.video_path), "")
+        VideoProcessor([NearestNeighborPass(vd, self.frames_cache)]).process()
+        assign_chain_ids(self.frames_cache)
+        
+        checked_cids = {
+            cid
             for i in range(self.faceList.count())
-            if self.faceList.item(i).checkState() == Qt.CheckState.Unchecked
+            if self.faceList.item(i).checkState() == Qt.CheckState.Checked
+            for cid in self.faceList.item(i).data(Qt.ItemDataRole.UserRole)
         }
+        if not checked_cids:
+            QMessageBox.information(self, "Nothing selected","Tick at least one face to keep.")
+            return
 
-        if unchecked:
-            for fd in self.frames_cache:
-                fd.faces = [f for f in fd.faces if f.cid not in unchecked]
-            self.parent.logView.append(
-                f"{self.video_name}: removed {len(unchecked)} chains; relinking…")
-        else:
-            self.parent.logView.append(f"{self.video_name}: relinking…")
+        for fd in self.frames_cache:
+            fd.faces = [f for f in fd.faces if f.cid in checked_cids]
+        self.parent.logView.append(
+            f"{self.video_name}: kept {len(checked_cids)} chains; relinking…")
 
         
         vd = VideoData(str(self.video_path), "")
@@ -345,7 +318,7 @@ class VideoWorker(QObject):
         frames = self.workspace / 'frames'
         frames.mkdir(exist_ok=True)
         py = sys.executable
-        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 's3fd']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
+        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 'haar']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
         print(f"[DEBUG] Worker finished for {self.filename}: {ok}")
         self.finished.emit(self.filename, ok)
 
