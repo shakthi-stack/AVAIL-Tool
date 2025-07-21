@@ -9,6 +9,7 @@ from collections import Counter
 import cv2
 import json               
 from functools import partial
+from typing import NamedTuple, List
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -30,7 +31,7 @@ from timeline import Timeline
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, Qt, QSize
 from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QPushButton, QToolBox, QLabel, QWidget, QMessageBox, QProgressBar, QTextEdit, QListWidget, QListWidgetItem, QTabWidget, QListView  
 from PyQt6 import uic
-from PyQt6.QtGui import QPixmap, QImage, QIcon
+from PyQt6.QtGui import QPixmap, QImage, QIcon, QBrush
 
 INSTRUCTION_MD = """
 ### Workflow
@@ -64,6 +65,11 @@ INSTRUCTION_MD = """
 *Tip:* You can keep several videos open in tabs; each remembers its own
 state.
 """
+
+class CardInfo(NamedTuple):
+    cid_list: List[int]   # chains in this id cluster
+    keep: bool = False    # tick to keep
+    is_key: bool = False  # at most one card has this True
 
 def count_dangling_neighbors(frames) -> int:
     # Return how many forward/backward links point to a face that no longer exists in its frame.
@@ -149,6 +155,10 @@ class VideoTab(QWidget):
         self.faceList.setViewMode(QListWidget.ViewMode.IconMode)
         self.faceList.setIconSize(QSize(96, 96))
         self.faceList.setResizeMode(QListWidget.ResizeMode.Adjust)
+
+        self.faceList.itemClicked.connect(self._card_clicked)
+
+
         
         self.continueBtn  = QPushButton("Continue")  # phase 1  phase-2
         self.phaseBox     = QWidget()                # holds phase-2 + timeline
@@ -157,6 +167,8 @@ class VideoTab(QWidget):
         lay.addWidget(self.faceList)
         lay.addWidget(self.continueBtn)
         lay.addWidget(self.phaseBox)
+
+
 
         self.continueBtn.clicked.connect(self.on_continue)
         
@@ -167,6 +179,30 @@ class VideoTab(QWidget):
         self.timeline:      'Timeline' | None = None
 
         self._load_gallery()
+    
+    def _card_clicked(self, item: QListWidgetItem):
+        ci: CardInfo = item.data(Qt.ItemDataRole.UserRole)
+
+        # Ctrl-click → (de)select *key* subject
+        if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
+            # clear any existing key card
+            
+
+            ci = ci._replace(keep=True, is_key=not ci.is_key)
+
+        # plain click to keep / drop toggle
+        else:
+            ci = ci._replace(keep=not ci.keep)
+            if not ci.keep:
+                ci = ci._replace(is_key=False)
+
+        # visual cue
+        bg = Qt.GlobalColor.blue if ci.is_key        else \
+            Qt.GlobalColor.lightGray if ci.keep     else QBrush(Qt.BrushStyle.NoBrush)
+        item.setBackground(bg)
+        item.setData(Qt.ItemDataRole.UserRole, ci)
+
+    
 
     def _load_gallery(self) -> None:
        
@@ -193,8 +229,11 @@ class VideoTab(QWidget):
         for lbl, cid_list in clusters.items():
             qimg = thumbs[lbl]                         
             it = QListWidgetItem(QIcon(QPixmap.fromImage(qimg)), "")
-            it.setData(Qt.ItemDataRole.UserRole, cid_list)
-            it.setCheckState(Qt.CheckState.Unchecked)  
+            ci = CardInfo(cid_list, keep=False, is_key=False)
+            it.setData(Qt.ItemDataRole.UserRole, ci)
+            # it.setData(Qt.ItemDataRole.UserRole, cid_list)
+            it.setBackground(QBrush(Qt.BrushStyle.NoBrush))
+            # it.setCheckState(Qt.CheckState.Unchecked)  
             self.faceList.addItem(it)
         self.parent.logView.append(f"{self.video_name}: loaded {len(clusters)} identities for review.")
 
@@ -207,24 +246,42 @@ class VideoTab(QWidget):
         VideoProcessor([NearestNeighborPass(vd, self.frames_cache)]).process()
         assign_chain_ids(self.frames_cache)
         
-        checked_cids = {
-            cid
-            for i in range(self.faceList.count())
-            if self.faceList.item(i).checkState() == Qt.CheckState.Checked
-            for cid in self.faceList.item(i).data(Qt.ItemDataRole.UserRole)
-        }
-        if not checked_cids:
-            QMessageBox.information(self, "Nothing selected","Tick at least one face to keep.")
+        # checked_cids = {
+        #     cid
+        #     for i in range(self.faceList.count())
+        #     if self.faceList.item(i).checkState() == Qt.CheckState.Checked
+        #     for cid in self.faceList.item(i).data(Qt.ItemDataRole.UserRole)
+        # }
+        # if not checked_cids:
+        #     QMessageBox.information(self, "Nothing selected","Tick at least one face to keep.")
+        #     return
+        key_cids, keep_cids = set(), set()
+        for i in range(self.faceList.count()):
+            ci: CardInfo = self.faceList.item(i).data(Qt.ItemDataRole.UserRole)
+            if ci.keep:
+                keep_cids.update(ci.cid_list)
+            if ci.is_key:
+                key_cids.update(ci.cid_list)
+        if not key_cids:
+            QMessageBox.information(self, "Choose key subject", "Ctrl-click one card to mark the key subject.")
             return
 
         for fd in self.frames_cache:
-            fd.faces = [f for f in fd.faces if f.cid in checked_cids]
+            new_faces = []
+            for f in fd.faces:
+                if f.cid not in keep_cids:
+                    continue
+                f.tag = None if f.cid in key_cids else "not child"
+                new_faces.append(f)
+            fd.faces = new_faces
+
         self.parent.logView.append(
-            f"{self.video_name}: kept {len(checked_cids)} chains; relinking…")
+            f"{self.video_name}: kept {len(keep_cids)} chains "
+            f"({len(key_cids)} key). Relinking & saving…")
 
         
-        vd = VideoData(str(self.video_path), "")
-        VideoProcessor([NearestNeighborPass(vd, self.frames_cache)]).process()
+        # vd = VideoData(str(self.video_path), "")
+        # VideoProcessor([NearestNeighborPass(vd, self.frames_cache)]).process()
 
         RemoveNeighborsPass(None, self.frames_cache).execute()
 
@@ -318,7 +375,7 @@ class VideoWorker(QObject):
         frames = self.workspace / 'frames'
         frames.mkdir(exist_ok=True)
         py = sys.executable
-        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 'haar']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
+        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 's3fd']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
         print(f"[DEBUG] Worker finished for {self.filename}: {ok}")
         self.finished.emit(self.filename, ok)
 

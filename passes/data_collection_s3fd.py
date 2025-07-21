@@ -5,9 +5,12 @@ from util.objects import *
 from passes.data_collection_pass import DataCollectionPass
 import torch.nn.functional as F
 from torch.autograd import Variable
+from torch.cuda.amp import autocast
 from s3fd.net_s3fd import s3fd
 from s3fd.bbox import *
-
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32      = False
+torch.backends.cudnn.benchmark = True
 
 class DataCollectionS3fd(DataCollectionPass):
     def __init__(self, video_data, frames, confidence=0.8, device='cuda', detect_large=True):
@@ -18,6 +21,9 @@ class DataCollectionS3fd(DataCollectionPass):
 
         current_dir = os.path.dirname(os.path.realpath(__file__))
         self.net.load_state_dict(torch.load(f'{current_dir}/../s3fd/s3fd_convert.pth'))
+        if torch.cuda.is_available():
+            print(torch.cuda.get_device_properties(0))
+            print(torch.cuda.memory_summary(device=0, abbreviated=True))
         try:
             self.net.to(self.device).float()
         except AssertionError as ae:
@@ -27,6 +33,7 @@ class DataCollectionS3fd(DataCollectionPass):
             self.net.to(self.device).float()
 
         self.net.eval()
+        torch.backends.cudnn.benchmark = True
 
         self.detect_large = detect_large
 
@@ -49,7 +56,7 @@ class DataCollectionS3fd(DataCollectionPass):
             index += 1
 
     def iterative_step(self, video, index):
-        # setup the frame object and read the image
+
         _, img = video.read()
         frame = FrameData(index)
 
@@ -70,7 +77,7 @@ class DataCollectionS3fd(DataCollectionPass):
         bboxlist = np.concatenate((b1, b2, b3, b4))
 
         keep = nms(bboxlist, self.confidence)
-        keep = keep[0:750]  # keep only max 750 boxes
+        keep = keep[0:750] 
         bboxlist = bboxlist[keep, :]
 
         for face in bboxlist:
@@ -81,41 +88,89 @@ class DataCollectionS3fd(DataCollectionPass):
             face_obj = Face(x, y, w, h)
             face_obj.bind_to_frame(self.video_data.width, self.video_data.height)
             frame.add_face(face_obj)
-        # store this frame
+    
         self.frames.append(frame)
 
+    # def detect(self, net, img):
+    #     img = img - np.array([104, 117, 123])
+    #     img = img.transpose(2, 0, 1)
+    #     img = img.reshape((1,) + img.shape)
+
+    #     img = Variable(torch.from_numpy(img).float()).to(self.device)
+
+    #     with torch.no_grad():
+    #         with autocast():                  
+    #             olist = net(img)
+    #     BB, CC, HH, WW = img.size()
+    #     olist = net(img)
+
+    #     bboxlist = []
+    #     for i in range(int(len(olist) / 2)): olist[i * 2] = F.softmax(olist[i * 2])
+    #     for i in range(int(len(olist) / 2)):
+    #         ocls, oreg = olist[i * 2].data.cpu(), olist[i * 2 + 1].data.cpu()
+    #         FB, FC, FH, FW = ocls.size()  # feature map size
+    #         stride = 2 ** (i + 2)  # 4,8,16,32,64,128
+    #         anchor = stride * 4
+    #         for Findex in range(FH * FW):
+    #             windex, hindex = Findex % FW, Findex // FW
+    #             axc, ayc = stride / 2 + windex * stride, stride / 2 + hindex * stride
+    #             score = ocls[0, 1, hindex, windex]
+    #             loc = oreg[0, :, hindex, windex].contiguous().view(1, 4)
+    #             if score < 0.05: continue
+    #             priors = torch.Tensor([[axc / 1.0, ayc / 1.0, stride * 4 / 1.0, stride * 4 / 1.0]])
+    #             variances = [0.1, 0.2]
+    #             box = decode(loc, priors, variances)
+    #             x1, y1, x2, y2 = box[0] * 1.0
+    #             # cv2.rectangle(imgshow,(int(x1),int(y1)),(int(x2),int(y2)),(0,0,255),1)
+    #             bboxlist.append([x1, y1, x2, y2, score])
+    #     bboxlist = np.array(bboxlist)
+    #     if 0 == len(bboxlist): bboxlist = np.zeros((1, 5))
+    #     return bboxlist
+
     def detect(self, net, img):
+        # downsample
+        h, w = img.shape[:2]
+        MAX_SIDE = 960
+        if max(h, w) > MAX_SIDE:
+            scale0 = MAX_SIDE / max(h, w)
+            img = cv2.resize(img, None, fx=scale0, fy=scale0)
+
         img = img - np.array([104, 117, 123])
-        img = img.transpose(2, 0, 1)
-        img = img.reshape((1,) + img.shape)
+        img = img.transpose(2, 0, 1)[None, ...]          
+        img_t = torch.from_numpy(img).float().to(self.device)
 
         with torch.no_grad():
-            img = Variable(torch.from_numpy(img).float()).to(self.device)
-        BB, CC, HH, WW = img.size()
-        olist = net(img)
+            with autocast():
+                olist = net(img_t)
 
         bboxlist = []
-        for i in range(int(len(olist) / 2)): olist[i * 2] = F.softmax(olist[i * 2])
-        for i in range(int(len(olist) / 2)):
-            ocls, oreg = olist[i * 2].data.cpu(), olist[i * 2 + 1].data.cpu()
-            FB, FC, FH, FW = ocls.size()  # feature map size
-            stride = 2 ** (i + 2)  # 4,8,16,32,64,128
-            anchor = stride * 4
-            for Findex in range(FH * FW):
-                windex, hindex = Findex % FW, Findex // FW
-                axc, ayc = stride / 2 + windex * stride, stride / 2 + hindex * stride
-                score = ocls[0, 1, hindex, windex]
-                loc = oreg[0, :, hindex, windex].contiguous().view(1, 4)
-                if score < 0.05: continue
-                priors = torch.Tensor([[axc / 1.0, ayc / 1.0, stride * 4 / 1.0, stride * 4 / 1.0]])
-                variances = [0.1, 0.2]
-                box = decode(loc, priors, variances)
-                x1, y1, x2, y2 = box[0] * 1.0
-                # cv2.rectangle(imgshow,(int(x1),int(y1)),(int(x2),int(y2)),(0,0,255),1)
+    
+        for i in range(len(olist) // 2):
+            olist[i*2] = F.softmax(olist[i*2], dim=1)
+
+        for i in range(len(olist) // 2):
+            ocls = olist[i*2].data.cpu()
+            oreg = olist[i*2 + 1].data.cpu()
+            FB, FC, FH, FW = ocls.size()
+            stride = 2 ** (i + 2)
+            for idx in range(FH * FW):
+                wx, hy = idx % FW, idx // FW
+                score = ocls[0, 1, hy, wx]
+                if score < 0.05:
+                    continue
+                loc = oreg[0, :, hy, wx].view(1, 4)
+                loc = loc.float()
+                priors = torch.Tensor([[stride/2 + wx*stride,
+                                        stride/2 + hy*stride,
+                                        stride*4,
+                                        stride*4]])
+                box = decode(loc, priors, [0.1, 0.2])
+                x1, y1, x2, y2 = box[0]
                 bboxlist.append([x1, y1, x2, y2, score])
-        bboxlist = np.array(bboxlist)
-        if 0 == len(bboxlist): bboxlist = np.zeros((1, 5))
-        return bboxlist
+
+        if not bboxlist:
+            return np.zeros((1,5))
+        return np.array(bboxlist)
 
     def flip_detect(self, net, img):
         img = cv2.flip(img, 1)
@@ -131,6 +186,11 @@ class DataCollectionS3fd(DataCollectionPass):
 
     def scale_detect(self, net, img, scale=2.0, facesize=None):
         img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+        target_max = 1500
+        h, w = img.shape[:2]
+        if max(h, w) > target_max:
+            scale = target_max / max(h, w)
+            img = cv2.resize(img, (0,0), fx=scale, fy=scale)
         b = self.detect(net, img)
 
         bboxlist = np.zeros(b.shape)

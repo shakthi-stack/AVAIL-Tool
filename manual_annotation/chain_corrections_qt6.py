@@ -33,7 +33,14 @@ CYAN = QColor("#00FFFF")
 HALO = QColor(0, 0, 0, 128)
 
 class FaceRect(QGraphicsRectItem):
+    _TAG_COLOR = {
+        None: QColor(  0,   0, 255),   # key  blue
+        "not child": QColor(255,   0,   0),   # other red
+    }
    
+    def _pen_for_face(self):
+        color = self._TAG_COLOR.get(self.face.tag, CYAN)  # fallback cyan
+        return QPen(color, 4)
     # selected = pyqtSignal(object)
 
     def __init__(self, face: Face, rect: QRectF, parent_widget: 'App'):
@@ -50,7 +57,8 @@ class FaceRect(QGraphicsRectItem):
         # remember so we can move it together (optional)
         # self._halo_item = halo
 
-        self.setPen(QPen(CYAN, 4))
+        # self.setPen(QPen(CYAN, 4))
+        self.setPen(self._pen_for_face())
         self.setZValue(1)
         # interactivity flags
         self.setFlags(
@@ -125,7 +133,9 @@ class FaceRect(QGraphicsRectItem):
         
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
             # self.setPen(QPen(Qt.GlobalColor.red if value else Qt.GlobalColor.blue, 2))
-            self.setPen(QPen(Qt.GlobalColor.red if value else CYAN, 4))
+            # self.setPen(QPen(Qt.GlobalColor.red if value else CYAN, 4))
+            sel_pen = QPen(QColor(255, 0, 0), 4)
+            self.setPen(sel_pen if value else self._pen_for_face())
             # if hasattr(self, "_halo_item"):
             #     self._halo_item.setRect(self.rect().adjusted(-1, -1, 1, 1))
         return super().itemChange(change, value)
@@ -405,6 +415,15 @@ class App(QWidget):
             QPushButton:hover { background:#e74c3c; }
         """)
 
+        btnKey = QPushButton("Set Key", self.chainBox)
+        btnKey.setStyleSheet("""
+            QPushButton { background:#0066cc; color:white; border:1px solid #0080ff;
+                        border-radius:4px; padding:2px 10px; font-weight:bold; }
+            QPushButton:hover { background:#338dff; }
+        """)
+        btnKey.clicked.connect(self._btn_set_key_subject)
+        lay.addWidget(btnKey)
+
         font = self.chainBox.font()
         font.setPointSize(9)            
         self.chainBox.setFont(font)
@@ -418,9 +437,16 @@ class App(QWidget):
         btnApply.clicked.connect(self._apply_propagate)
         btnDelete.clicked.connect(self._delete_current_chain)
 
+        # btn_key = QToolButton(self)
+        # btn_key.setText("Set Key")                    
+        # btn_key.setToolTip("Mark the selected rectangle's chain as KEY subject")
+        # btn_key.clicked.connect(self._btn_set_key_subject)
+        # toolbar.addWidget(btn_key)
+
         btnDone = QToolButton(self)
         btnDone.setText("Done")
         btnDone.clicked.connect(self._done_and_close)
+
 
         toolbar.addWidget(btnDone)       
        
@@ -493,7 +519,25 @@ class App(QWidget):
         self._draw_rects()
         self.markerAdded.emit(self.index, "del")
         self._hide_chain_controls()
+    
+    def _selected_face_rect(self):
+        sel = [it for it in self.scene.selectedItems()
+            if isinstance(it, FaceRect)]   
+        return sel[0] if sel else None
 
+    def _btn_set_key_subject(self):
+        rect_item = self._selected_face_rect()
+        if rect_item is None:
+            QMessageBox.information(
+                self, "Select a face", "Click a rectangle first.")
+            return
+
+        key_cid = rect_item.face.cid    
+        for fr in self.frame_data:
+            for face in fr.faces:
+                face.tag = None if face.cid == key_cid else "not child"
+
+        self._draw_rects()                  # your existing repaint helper
     def _toggle_flag(self, flag: str):
         ann = self.frame_data[self.index].manual_annotation
         setattr(ann, flag, not getattr(ann, flag))        

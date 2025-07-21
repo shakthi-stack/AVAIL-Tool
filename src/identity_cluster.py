@@ -2,6 +2,8 @@ import pickle, cv2, numpy as np, pathlib
 import sys
 from sklearn.cluster import AgglomerativeClustering 
 from PyQt6.QtGui import QImage 
+from itertools import combinations
+from scipy.spatial.distance import cosine
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -11,7 +13,10 @@ MANUAL_DIR = ROOT_DIR / "manual_annotation"
 if str(MANUAL_DIR) not in sys.path:
     sys.path.insert(0, str(MANUAL_DIR))
 
-
+MIN_DET_CONF  = 0.40     # Face.score threshold
+MIN_BBOX_AREA = 900      # 30×30 px
+MIN_CHAIN_LEN = 3        # ignore 1 or 2 frame flickers
+MAX_CLUSTERS  = 4000     # cap for O(N^2) clustering
 
 def _ensure_chain_ids(frames, pkl_path):
     first_face = frames[0].faces[0] if frames and frames[0].faces else None
@@ -49,10 +54,16 @@ def _rep_crop(jpg_path: str, face):
         x, y = int(face.x1), int(face.y1)
         w, h = int(face.x2 - face.x1), int(face.y2 - face.y1)
 
-    # clamp to image bounds
-    x, y = max(0, x), max(0, y)
-    crop = img[y : y + h, x : x + w]
-    return crop
+    # # clamp to image bounds
+    # x, y = max(0, x), max(0, y)
+    # crop = img[y : y + h, x : x + w]
+    # return crop
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(img.shape[1], x + w), min(img.shape[0], y + h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    crop = img[y1:y2, x1:x2]
+    return crop if crop.size else None
 
 def cluster_identities(pkl_path: pathlib.Path, thumb_size=96):
     with open(pkl_path, "rb") as f:
@@ -60,31 +71,92 @@ def cluster_identities(pkl_path: pathlib.Path, thumb_size=96):
     
     _ensure_chain_ids(frames, pkl_path)
     # collect one sample per chain
-    chains, reps, jpgs = {}, [], {}
+    chains, reps, jpgs, good_cids = {}, [], {}, []
+    bad_chains, short_chains = 0, 0
+
     for fd in frames:
         for fce in fd.faces:
             chains.setdefault(fce.cid, []).append((fd.index, fce))
 
     for cid, samples in chains.items():
+        if len(samples) < MIN_CHAIN_LEN:
+            short_chains += 1
+            continue
+
         frm_idx, fce = samples[len(samples)//2]         # middle sample
+
+        if hasattr(fce, "score") and fce.score < MIN_DET_CONF:
+            bad_chains += 1
+            continue
+        if fce.w * fce.h < MIN_BBOX_AREA:
+            bad_chains += 1
+            continue
+
         jpg = pkl_path.with_name("frames") / pkl_path.stem / f"{frm_idx}.jpg"
         if not jpg.exists():
             jpg = pkl_path.with_name("frames") / f"{frm_idx}.jpg"
-        reps.append(_embed(_rep_crop(str(jpg), fce)))
+        # reps.append(_embed(_rep_crop(str(jpg), fce)))
+        crop = _rep_crop(str(jpg), fce)
+        if crop is None: 
+            bad_chains += 1
+            continue
+        reps.append(_embed(crop))
         jpgs[cid] = (str(jpg), fce)
-
+        good_cids.append(cid) 
+    print(f"[identity_cluster] filtered {bad_chains + short_chains} chains "
+      f"({short_chains} short, {bad_chains} low-quality); "
+      f"{len(good_cids)} remain.")
+    if not reps:               
+        return {}, {}
+    
     emb = np.stack(reps)
     lbls = AgglomerativeClustering(
               n_clusters=None, distance_threshold=0.35,
-              linkage="average").fit_predict(emb)
+              linkage="average", compute_full_tree="auto").fit_predict(emb)
+    
+    parent = {cid: cid for cid in good_cids}
+    def root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = root(a), root(b)
+        if ra != rb:
+            parent[rb] = ra
+    rep_vec = {cid: emb[i] for i, cid in enumerate(good_cids)}
+    for a, b in combinations(good_cids, 2):
+        if cosine(rep_vec[a], rep_vec[b]) < 0.25:   # ↞ tweak radius
+            union(a, b)
+    
+    clusters = {}
+    for cid, lbl in zip(good_cids, lbls):
+        lbl = root(cid)              
+        clusters.setdefault(lbl, []).append(cid)
+    
+    for cid_list in clusters.values():
+        key = next((c for c in cid_list if getattr(jpgs[c][1], 'is_key', False)), None)
+        if key is None:
+            key = max(cid_list, key=lambda c: len(chains[c]))
+        for c in cid_list:
+            setattr(jpgs[c][1], 'is_key', c == key)
+    
 
     clusters = {}
     thumbs   = {}
-    for cid, lbl in zip(chains.keys(), lbls):
+    for cid, lbl in zip(good_cids, lbls):
         clusters.setdefault(lbl, []).append(cid)
     for lbl, cid_list in clusters.items():
-        jpg, face = jpgs[cid_list[0]]
-        crop = cv2.resize(_rep_crop(jpg, face), (thumb_size, thumb_size))
+        # jpg, face = jpgs[cid_list[0]]
+        # crop = cv2.resize(_rep_crop(jpg, face), (thumb_size, thumb_size))
+        for cid in cid_list:
+            if cid in jpgs:
+                jpg, face = jpgs[cid]
+                crop = cv2.resize(_rep_crop(jpg, face), (thumb_size, thumb_size))
+                break
+            else:
+                continue
+
         qimg = QImage(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB).data,
                       thumb_size, thumb_size, 3*thumb_size,
                       QImage.Format.Format_RGB888)
