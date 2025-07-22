@@ -236,6 +236,9 @@ class App(QWidget):
         NN.execute()
         _, self.frame_data = NN.get_values()
 
+        from main import assign_chain_ids          
+        assign_chain_ids(self.frame_data)          
+
         if os.path.exists(self.annotation_path):
             with open(self.annotation_path, "rb") as f:
                 annotations = pickle.load(f)
@@ -274,7 +277,12 @@ class App(QWidget):
         if not self.frame_data:
             self.log("Frame list empty — cannot continue.")
             return
-
+        
+    def _next_free_cid(self) -> int:
+        return max((getattr(f, "cid", -1)
+                    for fd in self.frame_data
+                    for f  in fd.faces), default=-1) + 1
+    
     def save_data(self):
         with open(self.pickle_path, "wb") as pf:
             RNP = RemoveNeighborsPass(None, self.frame_data)
@@ -300,11 +308,11 @@ class App(QWidget):
             if (not force) and any(iou(face, f) >= iou_thr for f in fd.faces):
                 continue
             # clone (keep same geometry)
-            # clone = Face(face.x, face.y, face.w, face.h)
-            # clone.cid = face.cid
-            # clone.tag = face.tag
-            # fd.faces.append(clone)
-            fd.faces.append(Face(face.x, face.y, face.w, face.h))
+            clone = Face(face.x, face.y, face.w, face.h)
+            clone.cid = face.cid
+            clone.tag = face.tag
+            fd.faces.append(clone)
+            # fd.faces.append(Face(face.x, face.y, face.w, face.h))
 
     def init_UI(self):
         self.setWindowTitle('Manual Annotator: Phase 2 - Annotate Face Chains')
@@ -744,6 +752,8 @@ class App(QWidget):
         y1 /= self.scale
         y2 /= self.scale
         face = Face(x1, y1, x2 - x1, y2 - y1)
+        face.cid  = self._next_free_cid()  
+        face.tag  = "not child"             
         self.frame_data[self.index].faces.append(face)
 
     def frame_text(self):
