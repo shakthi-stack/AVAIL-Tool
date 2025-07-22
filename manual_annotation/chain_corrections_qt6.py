@@ -299,6 +299,12 @@ class App(QWidget):
     
     def propagate_face_forward(self, face: Face, from_idx: int, K: int = 20, iou_thr: float = 0.3, force: bool = False,):
         
+        if not hasattr(face, "cid"):
+            face.cid = self._next_free_cid()
+        if not hasattr(face, "tag"):
+            face.tag = "not child"  
+
+        
         for t in range(1, K + 1):
             idx = from_idx + t
             if idx >= len(self.frame_data):

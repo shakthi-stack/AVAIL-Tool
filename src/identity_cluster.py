@@ -19,17 +19,25 @@ MIN_CHAIN_LEN = 3        # ignore 1 or 2 frame flickers
 MAX_CLUSTERS  = 4000     # cap for O(N^2) clustering
 
 def _ensure_chain_ids(frames, pkl_path):
-    first_face = frames[0].faces[0] if frames and frames[0].faces else None
-    if first_face is not None and not hasattr(first_face, "cid"):
+    need_cids = False
+    for fr in frames:
+        for f in fr.faces:
+            if not hasattr(f, "cid"):
+                need_cids = True
+                break
+        if need_cids:
+            break
+    if not need_cids:         
+        return
+    
+    from util.objects import VideoData
+    from passes.nearest_neighbor_pass import NearestNeighborPass
+    from util.video_processor import VideoProcessor
+    from main import assign_chain_ids
 
-        from util.objects import VideoData, FrameData
-        from passes.nearest_neighbor_pass import NearestNeighborPass
-        from util.video_processor import VideoProcessor
-        from main import assign_chain_ids
-
-        vd = VideoData(str(pkl_path.with_suffix(".mp4")), str(pkl_path))
-        VideoProcessor([NearestNeighborPass(vd, frames)]).process()
-        assign_chain_ids(frames)
+    vd = VideoData(str(pkl_path.with_suffix(".mp4")), str(pkl_path))
+    VideoProcessor([NearestNeighborPass(vd, frames)]).process()
+    assign_chain_ids(frames)
 
 def _embed(bgr_crop: np.ndarray) -> np.ndarray:
     hsv = cv2.cvtColor(cv2.resize(bgr_crop, (64, 64)), cv2.COLOR_BGR2HSV)
