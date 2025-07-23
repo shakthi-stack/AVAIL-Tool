@@ -14,7 +14,7 @@ from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, QSizeF, pyqtSignal, pyqtSl
 from PyQt6.QtGui import QPixmap, QPen, QCursor, QColor, QBrush, QTransform
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QHBoxLayout, QPushButton,
-    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsItem, QToolButton, QStyle, QFrame, QSpinBox, QPlainTextEdit, QMessageBox
+    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsItem, QToolButton, QStyle, QFrame, QSpinBox, QPlainTextEdit, QMessageBox, QCheckBox
 )
 
 def iou(a: Face, b: Face) -> float:
@@ -162,8 +162,7 @@ class AnnotView(QGraphicsView):
         p   = self.parent()
         wr, hr = p._w_ratio, p._h_ratio
         scen = self.mapToScene(rb).boundingRect()
-        f = Face(scen.x()/wr, scen.y()/hr, scen.width()/wr, scen.height()/hr)
-        p.frame_data[p.index].faces.append(f)
+        p.add_face(scen.x(), scen.y(), scen.x() + scen.width(), scen.y() + scen.height())
         p._draw_rects()
         # p.propagate_face_forward(f, from_idx=p.index,K=10, force=True)
         p.markerAdded.emit(p.index, "add")
@@ -400,6 +399,10 @@ class App(QWidget):
 
         lay.addWidget(QLabel("frames", self.chainBox))
 
+        self.chkKey = QCheckBox("Key subject", self.chainBox)
+        lay.addWidget(self.chkKey)
+
+
         btnApply = QPushButton("Apply", self.chainBox)
         btnApply.setStyleSheet("""
             QPushButton {
@@ -428,15 +431,6 @@ class App(QWidget):
             }
             QPushButton:hover { background:#e74c3c; }
         """)
-
-        btnKey = QPushButton("Set Key", self.chainBox)
-        btnKey.setStyleSheet("""
-            QPushButton { background:#0066cc; color:white; border:1px solid #0080ff;
-                        border-radius:4px; padding:2px 10px; font-weight:bold; }
-            QPushButton:hover { background:#338dff; }
-        """)
-        btnKey.clicked.connect(self._btn_set_key_subject)
-        lay.addWidget(btnKey)
 
         font = self.chainBox.font()
         font.setPointSize(9)            
@@ -489,7 +483,8 @@ class App(QWidget):
     def log(self, text: str):
         self.cmd.setPlainText(text)
     def _show_chain_controls(self, rect_item):
-        self._active_rect = rect_item              
+        self._active_rect = rect_item         
+        self.chkKey.setChecked(rect_item.face.tag is None)     
         self.chainBox.show()
         self.chainBox.adjustSize()
 
@@ -507,14 +502,22 @@ class App(QWidget):
     def _apply_propagate(self):
         if not self._active_rect:
             return
-
+        
+        face  = self._active_rect.face
         total = self.spinFrames.value()   
-        if total <= 1:                
-            self._hide_chain_controls()
-            return
+        if total > 1:    
+            self.propagate_face_forward(face,from_idx=self.index,K=total - 1, force=True)
 
-        face = self._active_rect.face
-        self.propagate_face_forward(face,from_idx=self.index,K=total - 1, force=True)
+        want_key = self.chkKey.isChecked()
+        has_key  = (face.tag is None) 
+
+        if want_key != has_key:                # state changed
+            key_cid = face.cid
+            for fr in self.frame_data:
+                for f in fr.faces:
+                    f.tag = None if (want_key and f.cid == key_cid) else \
+                        ("not child" if f.cid == key_cid else f.tag)
+                    
         self._draw_rects()
         self._hide_chain_controls()               
 
@@ -545,6 +548,9 @@ class App(QWidget):
             QMessageBox.information(
                 self, "Select a face", "Click a rectangle first.")
             return
+        if not hasattr(rect_item.face, "cid"):         
+            rect_item.face.cid  = self._next_free_cid()
+            rect_item.face.tag  = "not child"
 
         key_cid = rect_item.face.cid    
         for fr in self.frame_data:
