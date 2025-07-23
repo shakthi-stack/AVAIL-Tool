@@ -12,12 +12,13 @@ from s3fd.bbox import *
 
 
 class DataCollectionS3fd(DataCollectionPass):
-    def __init__(self, video_data, frames, score_thr: float = 0.25, post_nms_score_thr: float = 0.5, iou_thr: float = 0.35, max_side = None,device='cuda', detect_large=True):
+    def __init__(self, video_data, frames, score_thr: float = 0.25, post_nms_score_thr: float = 0.5, iou_thr: float = 0.35, max_side = 1280,device='cuda', detect_large=True, use_amp = False):
         super().__init__(video_data, frames)
         self.score_thr = score_thr
         self.post_nms_score_thr = post_nms_score_thr
         self.iou_thr = iou_thr
         self.max_side = max_side  # set None to disable any global downscale
+        self.use_amp = use_amp
 
         self.device = device
         self.net = s3fd()
@@ -104,8 +105,12 @@ class DataCollectionS3fd(DataCollectionPass):
         return torch.from_numpy(img).float().to(self.device)
     
     def raw_s3fd(self, img_t: torch.Tensor):
-        with torch.no_grad(), autocast():
-            return self.net(img_t)
+        if self.use_amp and self.device.startswith("cuda"):
+            with torch.no_grad(), autocast():
+                return self.net(img_t)
+        else:
+            with torch.no_grad():
+                return self.net(img_t.float())
         
     def detect(self, net, img: np.ndarray) -> np.ndarray:
         img_t = self.preprocess(img)
