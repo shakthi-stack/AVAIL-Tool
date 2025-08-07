@@ -1,7 +1,8 @@
 # code is based off of implementation in
 # https://github.com/clcarwin/SFD_pytorch/blob/master/wider_eval_pytorch.py
 
-import os, time, cv2, torch, numpy as np
+import os, time, cv2, torch, numpy as np, multiprocessing
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
 from util.objects import *
 from passes.data_collection_pass import DataCollectionPass
 import torch.nn.functional as F
@@ -9,16 +10,37 @@ from torch.autograd import Variable
 from torch.cuda.amp import autocast
 from s3fd.net_s3fd import s3fd
 from s3fd.bbox import *
+from tqdm import tqdm
+import sys
 
+log_fh = open("progress.log", "w")
+class Tee(object):
+    def write(self, data):
+        sys.__stdout__.write(data)
+        log_fh.write(data)
+    def flush(self):
+        sys.__stdout__.flush()
+        log_fh.flush()
+
+tee = Tee()
+
+torch.set_num_threads(multiprocessing.cpu_count())
 
 class DataCollectionS3fd(DataCollectionPass):
-    def __init__(self, video_data, frames, score_thr: float = 0.25, post_nms_score_thr: float = 0.5, iou_thr: float = 0.35, max_side = 1280,device='cuda', detect_large=True, use_amp = False):
+    def __init__(self, video_data, frames, score_thr: float = 0.25, post_nms_score_thr: float = 0.5, iou_thr: float = 0.35, max_side = None,device='cpu', detect_large=True, use_amp = False,  batch_size:int = 16, flush_ms:int = 5):
         super().__init__(video_data, frames)
         self.score_thr = score_thr
         self.post_nms_score_thr = post_nms_score_thr
         self.iou_thr = iou_thr
         self.max_side = max_side  # set None to disable any global downscale
         self.use_amp = use_amp
+        self.batch_size = batch_size
+        self.flush_ms = flush_ms
+
+        # frame buffers
+        self._img_buf: list[np.ndarray]  = []
+        self._idx_buf: list[int] = []
+        self._last_flush_t: float = time.time()
 
         self.device = device
         self.net = s3fd()
@@ -40,62 +62,139 @@ class DataCollectionS3fd(DataCollectionPass):
 
     def execute(self):
         super().execute()
+        pbar = tqdm(
+        total=self.video_data.frame_count,
+        unit='frame',
+        desc='S3FD batched detect',
+        dynamic_ncols=True,file=tee)
 
         index = 0
         next_tick = 0
         tick_interval = 0.05
         while self.video.isOpened() and index < self.video_data.frame_count:
-            self.iterative_step(self.video, index)
+            ret, img = self.video.read()
+            if not ret:
+                print("Video ended or error reading frame.")
+                break
+            #add to buffer
+            self._img_buf.append(img)
+            self._idx_buf.append(index)
+            # self.iterative_step(self.video, index)
+            #flush buffer
+            time_waited = (time.time() - self._last_flush_t) * 1000
+            is_last     = index == self.video_data.frame_count - 1
+            if (len(self._img_buf) == self.batch_size) or is_last:
+                print(len(self._img_buf), self.batch_size)
+                self._process_batch()
+                pbar.update(len(self._idx_buf))
+                self._img_buf.clear(); self._idx_buf.clear()
+                self._last_flush_t = time.time()
+            
             # quick command line progress bar
-            if float(index) / self.video_data.frame_count > next_tick:
-                next_tick += tick_interval
-                print("{0:2.0f}% ---- frame {1:5.0f} ---- time {2:10.4f} s".format(
-                    float(index) / self.video_data.frame_count * 100,
-                    index,
-                    time.time() - self.start_time))
+            # if float(index) / self.video_data.frame_count > next_tick:
+            #     next_tick += tick_interval
+            #     print("{0:2.0f}% ---- frame {1:5.0f} ---- time {2:10.4f} s".format(
+            #         float(index) / self.video_data.frame_count * 100,
+            #         index,
+            #         time.time() - self.start_time))
 
             index += 1
+        pbar.close()
+        log_fh.close()
 
-    def iterative_step(self, video, index):
-        # setup the frame object and read the image
-        _, img = video.read()
-        frame = FrameData(index)
+    # def iterative_step(self, video, index):
+    #     # setup the frame object and read the image
+    #     _, img = video.read()
+    #     frame = FrameData(index)
 
-        b1 = self.detect(self.net, img)
-        b2 = self.flip_detect(self.net, img)
-        if img.shape[0] * img.shape[1] * 4 > 3000 * 3000:
-            b3 = np.zeros((1, 5))
-        elif self.detect_large:
-            try:
-                b3 = self.scale_detect(self.net, img, scale=2, facesize=60)
-            except:
-                b3 = np.zeros((1, 5))
-                self.detect_large = False
-                print("Not enough memory to do double scale detection")
-        else:
-            b3 = np.zeros((1, 5))
-        b4 = self.scale_detect(self.net, img, scale=0.5, facesize=100)
-        bboxlist = np.concatenate((b1, b2, b3, b4))
+    #     b1 = self.detect(self.net, img)
+    #     b2 = self.flip_detect(self.net, img)
+    #     if img.shape[0] * img.shape[1] * 4 > 3000 * 3000:
+    #         b3 = np.zeros((1, 5))
+    #     elif self.detect_large:
+    #         try:
+    #             b3 = self.scale_detect(self.net, img, scale=2, facesize=120)
+    #         except:
+    #             b3 = np.zeros((1, 5))
+    #             self.detect_large = False
+    #             print("Not enough memory to do double scale detection")
+    #     else:
+    #         b3 = np.zeros((1, 5))
+    #     b4 = self.scale_detect(self.net, img, scale=0.5, facesize=100)
+    #     bboxlist = np.concatenate((b1, b2, b3, b4))
 
-        keep = nms(bboxlist, self.iou_thr)
-        keep = keep[0:750]  # keep only max 750 boxes
-        bboxlist = bboxlist[keep]
-        # post‑NMS confidence filter
-        bboxlist = bboxlist[bboxlist[:, 4] >= self.post_nms_score_thr]
-        if bboxlist.size == 0:
-            self.frames.append(frame)
+    #     keep = nms(bboxlist, self.iou_thr)
+    #     keep = keep[0:750]  # keep only max 750 boxes
+    #     bboxlist = bboxlist[keep]
+    #     # post‑NMS confidence filter
+    #     bboxlist = bboxlist[bboxlist[:, 4] >= self.post_nms_score_thr]
+    #     if bboxlist.size == 0:
+    #         self.frames.append(frame)
+    #         return
+
+    #     for face in bboxlist:
+    #         x = int(face[0])
+    #         y = int(face[1])
+    #         w = int(face[2] - x)
+    #         h = int(face[3] - y)
+    #         face_obj = Face(x, y, w, h)
+    #         face_obj.bind_to_frame(self.video_data.width, self.video_data.height)
+    #         frame.add_face(face_obj)
+    #     # store this frame
+    #     self.frames.append(frame)
+
+    def _process_batch(self):
+        if not self._img_buf: 
             return
 
-        for face in bboxlist:
-            x = int(face[0])
-            y = int(face[1])
-            w = int(face[2] - x)
-            h = int(face[3] - y)
-            face_obj = Face(x, y, w, h)
-            face_obj.bind_to_frame(self.video_data.width, self.video_data.height)
-            frame.add_face(face_obj)
-        # store this frame
-        self.frames.append(frame)
+        # vectorised preprocessing
+        imgs_t = torch.stack([ self.preprocess(im) for im in self._img_buf ])  # (B,3,H,W)
+        olist = self.raw_s3fd(imgs_t)
+        for i in range(len(olist)//2):
+            olist[i*2] = F.softmax(olist[i*2], dim=1)
+
+        #perframe postprocessing
+        for b in range(len(self._img_buf)):
+            boxes = self._decode_one(olist, b)
+            frame = FrameData(self._idx_buf[b])
+
+            for (x1,y1,x2,y2,conf) in boxes:
+                face = Face(int(x1), int(y1), int(x2-x1), int(y2-y1))
+                face.bind_to_frame(self.video_data.width, self.video_data.height)
+                frame.add_face(face)
+
+            self.frames.append(frame)
+    def _decode_one(self, olist, b:int) -> np.ndarray:
+        bbox = []
+        for i in range(len(olist)//2):
+            ocls = olist[i*2][b].cpu()#(2, FH, FW)
+            oreg = olist[i*2+1][b].cpu()#(4, FH, FW)
+            FH, FW = ocls.shape[1:]
+            stride = 2 ** (i+2)
+
+            # vectorised score mask
+            scores = ocls[1].reshape(-1)
+            keep   = scores >= self.score_thr
+            if not keep.any(): continue
+            # indices of kept anchors
+            w_idx, h_idx = torch.meshgrid(torch.arange(FW), torch.arange(FH), indexing='xy')
+            w_idx = w_idx.flatten()[keep]; h_idx = h_idx.flatten()[keep]
+            loc   = oreg[:, h_idx, w_idx].T # (N,4)
+            pri   = torch.stack([ stride/2 + w_idx*stride,
+                                stride/2 + h_idx*stride,
+                                torch.full_like(w_idx, stride*4),
+                                torch.full_like(w_idx, stride*4) ], dim=1)
+
+            decoded = decode(loc, pri, [0.1,0.2]) # (N,4)
+            bbox.append( torch.column_stack([decoded, scores[keep][:,None]]) )
+
+        if not bbox:
+            return np.empty((0,5), dtype=np.float32)
+
+        bbox = torch.cat(bbox).numpy()
+        keep = nms(bbox, self.iou_thr)[:750]
+        bbox = bbox[keep]
+        return bbox[bbox[:,4] >= self.post_nms_score_thr]
 
     def preprocess(self, img: np.ndarray) -> torch.Tensor:
         if self.max_side and max(img.shape[:2]) > self.max_side:
@@ -169,7 +268,7 @@ class DataCollectionS3fd(DataCollectionPass):
         b[:, :4] /= scale
         
         if scale > 1:
-            mask = np.minimum(b[:, 2] - b[:, 0] + 1, b[:, 3] - b[:, 1] + 1) < facesize
+            mask = np.minimum(b[:, 2] - b[:, 0] + 1, b[:, 3] - b[:, 1] + 1) <= facesize
         else:
             mask = np.maximum(b[:, 2] - b[:, 0] + 1, b[:, 3] - b[:, 1] + 1) > facesize
         b = b[mask]
