@@ -1,4 +1,4 @@
-from PyQt6.QtCore import Qt, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, pyqtSignal, QPointF
 from PyQt6.QtGui import QPainter, QPen, QColor, QFont
 from PyQt6.QtWidgets import QWidget, QSizePolicy
 from collections import defaultdict
@@ -121,7 +121,8 @@ class Timeline(QWidget):
         p.drawRoundedRect(rect, 3, 3)
    
         p.setPen(Qt.GlobalColor.white)
-        p.drawText(tx, ty + fm.ascent(), tip)
+        # p.drawText(tx, ty + fm.ascent(), tip)
+        p.drawText(QPointF(tx, ty + fm.ascent()), tip)
 
         mark_h = 10                
         col = {                   
