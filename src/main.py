@@ -10,6 +10,8 @@ import cv2
 import json               
 from functools import partial
 from typing import NamedTuple, List
+from pathlib import Path
+import csv, datetime
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -183,7 +185,7 @@ class VideoTab(QWidget):
     def _card_clicked(self, item: QListWidgetItem):
         ci: CardInfo = item.data(Qt.ItemDataRole.UserRole)
 
-        # Ctrl-click → (de)select *key* subject
+        # choosing the key shubject(ctrl+click gives blue background)
         if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ControlModifier:
             # clear any existing key card
             
@@ -245,7 +247,7 @@ class VideoTab(QWidget):
         vd = VideoData(str(self.video_path), "")
         VideoProcessor([NearestNeighborPass(vd, self.frames_cache)]).process()
         assign_chain_ids(self.frames_cache)
-        
+        faces_before = sum(len(fd.faces) for fd in self.frames_cache)
         # checked_cids = {
         #     cid
         #     for i in range(self.faceList.count())
@@ -265,6 +267,21 @@ class VideoTab(QWidget):
         if not key_cids:
             QMessageBox.information(self, "Choose key subject", "Ctrl-click one card to mark the key subject.")
             return
+        
+        #logging edits (how many chains were shown/kept/keyed)
+        log_dir = self.video_path.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+        sel_csv = log_dir / f"{self.video_name}_phase1_selection.csv"
+        new_file = not sel_csv.exists()
+        with open(sel_csv, "a", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["ts","clip","clusters_shown","chains_kept","chains_key"])
+            w.writerow([
+                datetime.datetime.now().isoformat(timespec="seconds"),
+                self.video_name,
+                self.faceList.count(), len(keep_cids), len(key_cids)
+            ])
 
         for fd in self.frames_cache:
             new_faces = []
@@ -274,6 +291,17 @@ class VideoTab(QWidget):
                 f.tag = None if f.cid in key_cids else "not child"
                 new_faces.append(f)
             fd.faces = new_faces
+        
+        #logging edits (after removing faces)
+        faces_after = sum(len(fd.faces) for fd in self.frames_cache)
+        with open(sel_csv, "a", newline="") as f:
+            w = csv.writer(f)
+            # no header here; same file as above
+            w.writerow([
+                datetime.datetime.now().isoformat(timespec="seconds"),
+                self.video_name,
+                "faces_removed", faces_before - faces_after, "faces_remaining", faces_after
+            ])
 
         self.parent.logView.append(
             f"{self.video_name}: kept {len(keep_cids)} chains "
@@ -375,7 +403,7 @@ class VideoWorker(QObject):
         frames = self.workspace / 'frames'
         frames.mkdir(exist_ok=True)
         py = sys.executable
-        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 's3fd']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
+        ok = (self._run_and_stream([py, '-u', 'automatic_detection.py', str(video), str(pickle), '-d', 'haar']) and self._run_and_stream([py, '-u', 'create_frames_directory.py', str(video), str(frames)]))
         print(f"[DEBUG] Worker finished for {self.filename}: {ok}")
         self.finished.emit(self.filename, ok)
 

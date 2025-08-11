@@ -4,6 +4,7 @@ import pickle
 from pathlib import Path
 import cv2
 from bisect import bisect_right, bisect_left
+import json, csv, datetime
 
 from util.objects import Face
 from manual_annotation.annotation_utils import ManualAnnotation
@@ -97,6 +98,7 @@ class FaceRect(QGraphicsRectItem):
         super().hoverMoveEvent(event)
 
     def mousePressEvent(self, event):
+        self._prev_scene_rect = self.mapRectToScene(self.rect())
         self._dragging_handle = getattr(self, "_hover_handle", None)
         super().mousePressEvent(event)
 
@@ -126,6 +128,24 @@ class FaceRect(QGraphicsRectItem):
         if self.isSelected():
             # self.selected.emit(self)
             self.app._show_chain_controls(self)
+        try:
+            prev = getattr(self, "_prev_scene_rect", None)
+            curr = self.mapRectToScene(self.rect())
+            if prev is None:
+                return
+            moved   = (abs(curr.x() - prev.x()) > 1 or abs(curr.y() - prev.y()) > 1)
+            resized = (abs(curr.width()  - prev.width())  > 1 or
+                    abs(curr.height() - prev.height()) > 1)
+            if moved or resized:
+                kind = "move+resize" if (moved and resized) else ("move" if moved else "resize")
+                self.app._log_event(
+                    kind,
+                    cid=int(getattr(self.face, "cid", -1)),
+                    prev=[prev.x(), prev.y(), prev.width(), prev.height()],
+                    curr=[curr.x(), curr.y(), curr.width(), curr.height()],
+                )
+        except Exception:
+            pass
 
     def itemChange(self, change: 'QGraphicsItem.GraphicsItemChange', value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and not self._dragging_handle:
@@ -183,6 +203,11 @@ class App(QWidget):
         self.pickle_path = pickle_path
         self.scale = scale
 
+        # logging
+        self._log_dir = Path(self.pickle_path).parent / "logs"
+        self._log_dir.mkdir(exist_ok=True)
+        self._events_fp = self._log_dir / f"{Path(self.pickle_path).stem}_phase2_edits.jsonl"
+
         self.index = 0
         self._w_ratio = self._h_ratio = 1.0
         self._rects   = []
@@ -219,6 +244,17 @@ class App(QWidget):
 
         self.init_data()
         self.init_UI()
+
+    def _log_event(self, kind: str, **payload):
+        rec = {
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+            "clip": Path(self.video_path).stem,
+            "frame": int(self.index),
+            "kind": kind,
+        }
+        rec.update(payload)
+        with open(self._events_fp, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
 
     def init_data(self):
 
@@ -295,6 +331,30 @@ class App(QWidget):
         self.log(f"Saved detection: >> {self.pickle_path}\n"
                 f"Saved annotations: >> {self.annotation_path}\n"
                 f"{self.print_info()}")
+        sum_csv = self._log_dir / f"{Path(self.pickle_path).stem}_phase2_summary.csv"
+        new_file = not sum_csv.exists()
+        face_count = 0
+        frame_count = 0
+        for frame in self.frame_data:
+            try:
+                if frame.manual_annotation.has_face:
+                    frame_count += 1
+                    for face in frame.faces:
+                        if face.tag is None:
+                            face_count += 1
+            except Exception:
+                pass
+        percentage = (100.0 * face_count / frame_count) if frame_count else 0.0
+
+        with open(sum_csv, "a", newline="") as f:
+            w = csv.writer(f)
+            if new_file:
+                w.writerow(["ts","clip","frames_with_GT_face","faces_key_in_frames","percentage"])
+            w.writerow([
+                datetime.datetime.now().isoformat(timespec="seconds"),
+                Path(self.video_path).stem,
+                frame_count, face_count, f"{percentage:.2f}"
+            ])
     
     def propagate_face_forward(self, face: Face, from_idx: int, K: int = 20, iou_thr: float = 0.3, force: bool = False,):
         
@@ -507,6 +567,10 @@ class App(QWidget):
         total = self.spinFrames.value()   
         if total > 1:    
             self.propagate_face_forward(face,from_idx=self.index,K=total - 1, force=True)
+            self._log_event("propagate",
+            cid=int(getattr(face, "cid", -1)),
+            frames=int(total - 1)
+            )
 
         want_key = self.chkKey.isChecked()
         has_key  = (face.tag is None) 
@@ -517,7 +581,11 @@ class App(QWidget):
                 for f in fr.faces:
                     f.tag = None if (want_key and f.cid == key_cid) else \
                         ("not child" if f.cid == key_cid else f.tag)
-                    
+        self._log_event("set_key_subject",
+            cid=int(getattr(face, "cid", -1)),
+            is_key=bool(self.chkKey.isChecked())
+        )
+        
         self._draw_rects()
         self._hide_chain_controls()               
 
@@ -526,6 +594,12 @@ class App(QWidget):
             return
 
         face_obj = self._active_rect.face
+
+        self._log_event("delete",
+        bbox=[face_obj.x, face_obj.y, face_obj.w, face_obj.h],
+        cid=int(getattr(face_obj, "cid", -1))
+        )
+
         fd = self.frame_data[self.index]
         fd.faces = [f for f in fd.faces
                     if not (abs(f.x - face_obj.x) < 1e-4 and
@@ -565,6 +639,7 @@ class App(QWidget):
         self.markerAdded.emit(self.index, "flag")
         self._cached_starts = self._cached_ends = None
         self.update_manual_annotation_status()
+        self._log_event("flag", which=flag, value=bool(getattr(ann, flag)))
 
     def _on_tick(self):
         self._next_frame()
@@ -638,17 +713,25 @@ class App(QWidget):
         self.log("")
 
         if e.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            changed = False
+            removed = []
+            # changed = False
             for item in list(self.scene.selectedItems()):
                 if isinstance(item, FaceRect):
                     face = item.face
                     if face in self.frame_data[self.index].faces:
                         self.frame_data[self.index].faces.remove(face)
                         self.scene.removeItem(item)
-                        changed = True
-            if changed:
+                        # changed = True
+                        removed.append(face)
+            if removed:
                 self._draw_rects()        
                 self.markerAdded.emit(self.index, "del")
+                for f in removed:
+                    self._log_event("delete",
+                        bbox=[f.x, f.y, f.w, f.h],
+                        cid=int(getattr(f, "cid", -1))
+                    )
+
             return                     
       
         if e.key() == Qt.Key.Key_Right:
@@ -767,6 +850,11 @@ class App(QWidget):
         face.cid  = self._next_free_cid()  
         face.tag  = "not child"             
         self.frame_data[self.index].faces.append(face)
+        self._log_event("add",
+        bbox=[face.x, face.y, face.w, face.h],
+        cid=int(face.cid),
+        tag=face.tag
+        )
 
     def frame_text(self):
         frame = self.frame_data[self.index]

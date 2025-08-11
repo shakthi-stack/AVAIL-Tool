@@ -4,6 +4,8 @@ from sklearn.cluster import AgglomerativeClustering
 from PyQt6.QtGui import QImage 
 from itertools import combinations
 from scipy.spatial.distance import cosine
+import csv, datetime
+from pathlib import Path
 
 ROOT_DIR = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -114,6 +116,21 @@ def cluster_identities(pkl_path: pathlib.Path, thumb_size=96):
     print(f"[identity_cluster] filtered {bad_chains + short_chains} chains "
       f"({short_chains} short, {bad_chains} low-quality); "
       f"{len(good_cids)} remain.")
+    
+    #logging edits made to the pkl file (short and low quality chains removed and then clustered)
+    log_dir = Path(pkl_path).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    csv_path = log_dir / f"{pkl_path.stem}_phase1_cluster_filter.csv"
+    new_file = not csv_path.exists()
+    with open(csv_path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new_file:
+            w.writerow(["ts","clip","short_chains","low_quality_chains","kept_chains"])
+        w.writerow([
+            datetime.datetime.now().isoformat(timespec="seconds"),
+            pkl_path.stem, short_chains, bad_chains, len(good_cids)
+        ])
+
     if not reps:               
         return {}, {}
     
@@ -134,7 +151,7 @@ def cluster_identities(pkl_path: pathlib.Path, thumb_size=96):
             parent[rb] = ra
     rep_vec = {cid: emb[i] for i, cid in enumerate(good_cids)}
     for a, b in combinations(good_cids, 2):
-        if cosine(rep_vec[a], rep_vec[b]) < 0.25:   # ↞ tweak radius
+        if cosine(rep_vec[a], rep_vec[b]) < 0.25: 
             union(a, b)
     
     clusters = {}
